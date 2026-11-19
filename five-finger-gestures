@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""five-finger-gestures: 5-finger touchpad gestures (and a 4-finger tap) on
+Linux, without also triggering the desktop's own 4-finger gestures.
+
+libinput, the touchpad driver behind GNOME, KDE and most Wayland desktops,
+reports a 5-finger swipe as a 4-finger swipe. So this program sits between
+the touchpad and the desktop: it takes the touchpad for itself and passes
+every touch through to a virtual copy of it, which the desktop uses instead.
+Touches of 1-4 fingers go through unchanged, so all normal gestures keep
+working. When a 5th finger lands, the copy's fingers are held still until the
+hand lifts, so the desktop sees no gesture, and this program runs the
+command for the 5-finger swipe, tap or pinch instead.
+
+If this program stops for any reason, the kernel hands the real touchpad
+back to the desktop and the copy disappears.
+
+Config: ~/.config/five-finger-gestures.conf, lines like
+    swipe up     = ~/.local/bin/gesture-key volumeup
+    tap          = ~/.local/bin/gesture-key playpause
+    4-finger tap = ~/.local/bin/gesture-key print
+Gestures: swipe up/down/left/right, tap, pinch in/out (5 fingers), 4-finger tap.
+
+Usage:  five-finger-gestures [--debug] [--device /dev/input/eventN]
+"""
+import fcntl, math, os, queue, select, shlex, struct, subprocess, sys, threading, time
+
+CONFIG = os.path.expanduser("~/.config/five-finger-gestures.conf")
+FINGERS = 5
+SWIPE_MM = 6         # how far the fingers must travel for a swipe
+PINCH_RATIO = 0.30   # how much the fingers must close/spread for a pinch (30%)
+KEEP_FINGERS = 3     # the gesture ends once fewer than this many of its fingers remain
+TAP_MM = 3           # a tap moves less than this...
+TAP_SECONDS = 0.35   # ...and lifts within this time
+COPY_MIN_HOLD = 0.3  # the desktop's view of a held-back touch lasts at least this
+                     # long, so its first 3 fingers never count as a 3-finger tap
+
+EV_SYN, EV_KEY, EV_ABS, EV_MSC = 0, 1, 3, 4
+SYN_REPORT, SYN_DROPPED = 0, 3
+ABS_MT_SLOT, ABS_MT_X, ABS_MT_Y, ABS_MT_ID = 0x2F, 0x35, 0x36, 0x39
+ABS_MT_LAST = 0x3C
+BTN_LEFT, BTN_TOOL_FINGER = 0x110, 0x145
+INPUT_PROP_POINTER, INPUT_PROP_DIRECT = 0, 1
+EVENT = struct.Struct("llHHi")
+DEBUG = "--debug" in sys.argv
+
+
+def log(*a):
+    if DEBUG:
+        print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+def warn(msg):
+    print(f"five-finger-gestures: {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- ioctls
+def ioc(direction, typ, nr, size):
+    return (direction << 30) | (size << 16) | (ord(typ) << 8) | nr
+
+
+def ior(nr, size):
+    return ioc(2, "E", nr, size)
+
+
+EVIOCGRAB = ioc(1, "E", 0x90, 4)
+UI_SET_EVBIT, UI_SET_KEYBIT = ioc(1, "U", 100, 4), ioc(1, "U", 101, 4)
+UI_SET_ABSBIT, UI_SET_MSCBIT = ioc(1, "U", 103, 4), ioc(1, "U", 104, 4)
+UI_SET_PROPBIT = ioc(1, "U", 110, 4)
+UI_DEV_SETUP, UI_ABS_SETUP = ioc(1, "U", 3, 92), ioc(1, "U", 4, 28)
+UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
+
+
+def bits(fd, nr, maxbit):
+    buf = bytearray(maxbit // 8 + 1)
+    fcntl.ioctl(fd, ior(nr, len(buf)), buf)
+    return [i for i in range(maxbit + 1) if buf[i // 8] >> (i % 8) & 1]
+
+
+def absinfo(fd, code):
+    buf = bytearray(24)
+    fcntl.ioctl(fd, ior(0x40 + code, 24), buf)  # EVIOCGABS
+    return struct.unpack("6i", buf)  # value, min, max, fuzz, flat, resolution
+
+
+def mt_values(fd, code, n):
+    """Current value of one ABS_MT_* axis for every slot (EVIOCGMTSLOTS)."""
+    buf = bytearray(struct.pack("I", code) + bytes(4 * n))
+    fcntl.ioctl(fd, ior(0x0A, len(buf)), buf)
+    return list(struct.unpack_from(f"{n}i", buf, 4))
+
+
+def make_copy(fd):
+    """Create a virtual touchpad identical to the real one (same name and IDs,
+    so the driver applies the same settings and quirks)."""
+    ui = os.open("/dev/uinput", os.O_WRONLY)
+    try:
+        types = bits(fd, 0x20, 0x1F)
+        for t in types:
+            fcntl.ioctl(ui, UI_SET_EVBIT, t)
+        for code in bits(fd, 0x20 + EV_KEY, 0x2FF):
+            fcntl.ioctl(ui, UI_SET_KEYBIT, code)
+        if EV_MSC in types:
+            for code in bits(fd, 0x20 + EV_MSC, 0x07):
+                fcntl.ioctl(ui, UI_SET_MSCBIT, code)
+        for prop in bits(fd, 0x09, 0x1F):
+            fcntl.ioctl(ui, UI_SET_PROPBIT, prop)
+        for code in bits(fd, 0x20 + EV_ABS, 0x3F):
+            fcntl.ioctl(ui, UI_SET_ABSBIT, code)
+            fcntl.ioctl(ui, UI_ABS_SETUP, struct.pack("=H2x6i", code, *absinfo(fd, code)))
+        ids = bytearray(8)
+        fcntl.ioctl(fd, ior(0x02, 8), ids)  # EVIOCGID
+        name = bytearray(80)
+        fcntl.ioctl(fd, ior(0x06, 80), name)  # EVIOCGNAME
+        fcntl.ioctl(ui, UI_DEV_SETUP, struct.pack("=8s80sI", bytes(ids), bytes(name[:79]), 0))
+        fcntl.ioctl(ui, UI_DEV_CREATE)
+    except Exception:
+        os.close(ui)
+        raise
+    return ui
+
+
+def find_touchpad():
+    if "--device" in sys.argv:
+        return sys.argv[sys.argv.index("--device") + 1]
+    # A touchpad: a multitouch pointer device (not a touchscreen) that reports
+    # finger counts. Virtual devices (like our own copy) are skipped.
+    unreadable = False
+    for node in sorted(os.listdir("/dev/input"), key=lambda s: (len(s), s)):
+        if not node.startswith("event"):
+            continue
+        if "/devices/virtual/" in os.path.realpath(f"/sys/class/input/{node}"):
+            continue
+        try:
+            fd = os.open(f"/dev/input/{node}", os.O_RDONLY)
+        except PermissionError:
+            unreadable = True
+            continue
+        except OSError:
+            continue
+        try:
+            props = bits(fd, 0x09, 0x1F)
+            if (INPUT_PROP_POINTER in props and INPUT_PROP_DIRECT not in props
+                    and ABS_MT_X in bits(fd, 0x20 + EV_ABS, 0x3F)
+                    and BTN_TOOL_FINGER in bits(fd, 0x20 + EV_KEY, 0x2FF)):
+                return f"/dev/input/{node}"
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    if unreadable:
+        raise PermissionError("can't read /dev/input devices: add yourself to the 'input' "
+                              "group (sudo usermod -aG input $USER) and log in again")
+    return None
+
+
+# ---------------------------------------------------------------- gestures
+def load_config():
+    actions = {}
+    try:
+        with open(CONFIG) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if "=" in line:
+                    key, cmd = line.split("=", 1)
+                    actions[" ".join(key.lower().split())] = cmd.strip()
+    except FileNotFoundError:
+        warn(f"{CONFIG} not found")
+    return actions
+
+
+def classify(dx, dy, ratio, actions):
+    pinch = "pinch out" if ratio > 1 else "pinch in"
+    pinched = abs(ratio - 1) >= PINCH_RATIO
+    # A pinch only wins over a swipe if it has an action, so fingers that
+    # spread a little during a swipe don't swallow it.
+    if pinched and pinch in actions and math.hypot(dx, dy) < 2 * SWIPE_MM:
+        return pinch
+    if max(abs(dx), abs(dy)) >= SWIPE_MM:
+        if abs(dx) > abs(dy):
+            return "swipe right" if dx > 0 else "swipe left"
+        return "swipe down" if dy > 0 else "swipe up"
+    return pinch if pinched else None
+
+
+# Commands run one at a time (each gets up to 2 s), so the key presses of two
+# quick gestures never overlap. The touchpad loop never waits on them.
+commands = queue.Queue()
+
+
+def run_commands():
+    running = []
+    while True:
+        cmd = commands.get()
+        running = [p for p in running if p.poll() is None]  # reap finished ones
+        try:
+            args = [os.path.expanduser(os.path.expandvars(a)) for a in shlex.split(cmd)]
+            quiet = None if DEBUG else subprocess.DEVNULL
+            p = subprocess.Popen(args, start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=quiet, stderr=quiet)
+        except Exception as e:
+            warn(f"can't run {cmd!r}: {e}")
+            continue
+        running.append(p)
+        try:
+            p.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass  # a program that stays open, e.g. a terminal
+
+
+# ---------------------------------------------------------------- main loop
+def watch(path):
+    fd = os.open(path, os.O_RDONLY)
+    ui = None
+    try:
+        nslots = absinfo(fd, ABS_MT_SLOT)[2] + 1
+        res_x = absinfo(fd, ABS_MT_X)[5] or 10
+        res_y = absinfo(fd, ABS_MT_Y)[5] or 10
+        if nslots < FINGERS:
+            warn(f"this touchpad only tracks {nslots} fingers at once, 5 are needed")
+            sys.exit(1)
+        mt_codes = [c for c in bits(fd, 0x20 + EV_ABS, 0x3F) if ABS_MT_SLOT < c <= ABS_MT_LAST]
+        st_codes = [c for c in bits(fd, 0x20 + EV_ABS, 0x3F) if c < ABS_MT_SLOT]
+
+        actions = load_config()
+        config_mtime = os.path.getmtime(CONFIG) if os.path.exists(CONFIG) else 0
+
+        # Mirror of the real touchpad's state.
+        slot = 0
+        mt = [dict() for _ in range(nslots)]  # slot -> {MT axis: value}
+        st = {}                               # single-touch axes (ABS_X, ...)
+
+        def ids():
+            return [m.get(ABS_MT_ID, -1) for m in mt]
+
+        def resync():
+            nonlocal slot
+            slot = absinfo(fd, ABS_MT_SLOT)[0]
+            for code in mt_codes:
+                for i, v in enumerate(mt_values(fd, code, nslots)):
+                    mt[i][code] = v
+            for code in st_codes:
+                st[code] = absinfo(fd, code)[0]
+
+        # What the copy (and so the desktop) currently sees.
+        copy_ids = [-1] * nslots
+        copy_keys = {}
+        copy_since = [0.0]  # when the copy's current touch began
+
+        def send(events):
+            os.write(ui, b"".join(EVENT.pack(0, 0, t, c, v) for t, c, v in events)
+                     + EVENT.pack(0, 0, EV_SYN, SYN_REPORT, 0))
+
+        def forward(frame, start_slot):
+            out = [(EV_ABS, ABS_MT_SLOT, start_slot)] + frame
+            now = ids()
+            for i in range(nslots):
+                if now[i] != -1 and now[i] != copy_ids[i]:
+                    # A new touch: send its full state, in case some values
+                    # changed while the copy wasn't being updated.
+                    out.append((EV_ABS, ABS_MT_SLOT, i))
+                    out += [(EV_ABS, c, mt[i].get(c, 0)) for c in mt_codes if c != ABS_MT_ID]
+                    out += [(EV_ABS, c, v) for c, v in st.items()]
+            for t, c, v in frame:
+                if t == EV_KEY:
+                    copy_keys[c] = v
+            if all(i == -1 for i in copy_ids) and any(i != -1 for i in now):
+                copy_since[0] = time.monotonic()
+            copy_ids[:] = now
+            send(out)
+
+        def release_copy():
+            if any(i != -1 for i in copy_ids):
+                wait = COPY_MIN_HOLD - (time.monotonic() - copy_since[0])
+                if wait > 0:
+                    time.sleep(wait)
+            out = []
+            for i in range(nslots):
+                if copy_ids[i] != -1:
+                    out += [(EV_ABS, ABS_MT_SLOT, i), (EV_ABS, ABS_MT_ID, -1)]
+            out += [(EV_KEY, c, 0) for c, v in copy_keys.items() if v]
+            copy_ids[:] = [-1] * nslots
+            copy_keys.clear()
+            if out:
+                send(out)
+
+        def measure(start, still):
+            """Average movement (mm) and spread change of a gesture's fingers
+            that are still down, each measured from where it started."""
+            k = len(still)
+            sx = sum(start[i][1] for i in still) / k
+            sy = sum(start[i][2] for i in still) / k
+            cx = sum(mt[i][ABS_MT_X] for i in still) / k
+            cy = sum(mt[i][ABS_MT_Y] for i in still) / k
+            s0 = sum(math.hypot((start[i][1] - sx) / res_x, (start[i][2] - sy) / res_y) for i in still)
+            s1 = sum(math.hypot((mt[i][ABS_MT_X] - cx) / res_x, (mt[i][ABS_MT_Y] - cy) / res_y) for i in still)
+            return (cx - sx) / res_x, (cy - sy) / res_y, (s1 / s0 if s0 else 1.0)
+
+        def current_actions():
+            nonlocal actions, config_mtime
+            mtime = os.path.getmtime(CONFIG) if os.path.exists(CONFIG) else 0
+            if mtime != config_mtime:  # pick up config edits without a restart
+                actions, config_mtime = load_config(), mtime
+            return actions
+
+        resync()
+        ui = make_copy(fd)
+        time.sleep(0.3)  # let the desktop pick up the copy before switching over
+        fcntl.ioctl(fd, EVIOCGRAB, 1)
+        log(f"{path}: passing through via a virtual copy; {nslots} touch slots")
+
+        holding = any(i != -1 for i in ids())  # pass nothing until the pad is empty
+        gesture, gesture_t0 = None, 0.0  # slot -> (tracking id, start x, start y)
+        moved = (0.0, 0.0, 1.0)
+        tap4, tap4_done = None, holding  # possible 4-finger tap in progress
+        tap4_moved, tap4_t0 = (0.0, 0.0, 1.0), 0.0
+        frame, frame_slot = [], slot
+        dropped = False
+        buf = b""
+
+        while True:
+            select.select([fd], [], [])
+            buf += os.read(fd, EVENT.size * 64)
+            while len(buf) >= EVENT.size:
+                _, _, etype, code, value = EVENT.unpack_from(buf)
+                buf = buf[EVENT.size:]
+
+                if etype == EV_SYN and code == SYN_DROPPED:
+                    dropped = True  # kernel buffer overflowed: events were lost
+                    continue
+                if dropped:
+                    if etype != EV_SYN or code != SYN_REPORT:
+                        continue
+                    dropped = False
+                    resync()
+                    frame = []
+                    gesture = None
+                    tap4, tap4_done = None, True
+                    if not holding:  # we no longer know what the copy should show
+                        holding = True
+                        release_copy()
+                elif etype != EV_SYN or code != SYN_REPORT:
+                    if etype == EV_ABS:
+                        if code == ABS_MT_SLOT:
+                            slot = value
+                        elif ABS_MT_SLOT < code <= ABS_MT_LAST:
+                            if 0 <= slot < nslots:
+                                mt[slot][code] = value
+                        else:
+                            st[code] = value
+                    if etype != EV_SYN:
+                        frame.append((etype, code, value))
+                    continue
+
+                # --- one complete touchpad frame ---
+                now = ids()
+                n = sum(1 for i in now if i != -1)
+
+                # 5 fingers: follow the gesture until the hand lifts.
+                if gesture is not None:
+                    still = [i for i, (tid, _, _) in gesture.items() if now[i] == tid]
+                    if len(still) >= KEEP_FINGERS:
+                        moved = measure(gesture, still)
+                    else:  # the hand has lifted: decide what it was
+                        gesture = None
+                        dx, dy, ratio = moved
+                        acts = current_actions()
+                        name = classify(dx, dy, ratio, acts)
+                        took = time.monotonic() - gesture_t0
+                        if name is None and math.hypot(dx, dy) < TAP_MM and took < TAP_SECONDS:
+                            name = "tap"
+                        cmd = acts.get(name) if name else None
+                        log(f"moved dx={dx:+.1f}mm dy={dy:+.1f}mm spread x{ratio:.2f}"
+                            f" -> {name or '(too small)'} -> {cmd or '(nothing)'}")
+                        if cmd:
+                            commands.put(cmd)
+
+                # 4-finger tap: the desktop ignores those, so just watch.
+                if tap4 is not None:
+                    clicked = any(t == EV_KEY and c == BTN_LEFT and v for t, c, v in frame)
+                    if n >= FINGERS or clicked:
+                        tap4, tap4_done = None, True  # it's a 5-finger gesture or a click
+                    else:
+                        still = [i for i, (tid, _, _) in tap4.items() if now[i] == tid]
+                        if len(still) >= KEEP_FINGERS:
+                            tap4_moved = measure(tap4, still)
+                        else:
+                            dx, dy, _ = tap4_moved
+                            took = time.monotonic() - tap4_t0
+                            tap4, tap4_done = None, True
+                            if math.hypot(dx, dy) < TAP_MM and took < TAP_SECONDS:
+                                cmd = current_actions().get("4-finger tap")
+                                log(f"4-finger tap -> {cmd or '(nothing)'}")
+                                if cmd:
+                                    commands.put(cmd)
+                elif not holding and not tap4_done and n == 4:
+                    tap4 = {i: (now[i], mt[i][ABS_MT_X], mt[i][ABS_MT_Y])
+                            for i in range(nslots) if now[i] != -1}
+                    tap4_moved, tap4_t0 = (0.0, 0.0, 1.0), time.monotonic()
+                if n == 0:
+                    tap4_done = False
+
+                if not holding and n >= FINGERS:
+                    # 5th finger: freeze what the desktop sees until the hand lifts
+                    holding = True
+                    gesture = {i: (now[i], mt[i][ABS_MT_X], mt[i][ABS_MT_Y])
+                               for i in range(nslots) if now[i] != -1}
+                    moved, gesture_t0 = (0.0, 0.0, 1.0), time.monotonic()
+                    log(f"{n} fingers down")
+                elif holding:
+                    if n == 0:
+                        release_copy()
+                        holding = False
+                else:
+                    forward(frame, frame_slot)
+                frame, frame_slot = [], slot
+    finally:
+        if ui is not None:
+            try:
+                fcntl.ioctl(ui, UI_DEV_DESTROY)
+            except OSError:
+                pass
+            os.close(ui)
+        os.close(fd)  # also releases the grab
+
+
+def main():
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print(__doc__.strip())
+        return
+
+    # Only one copy at a time.
+    lock = open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "five-finger-gestures.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        warn("already running")
+        sys.exit(1)
+
+    threading.Thread(target=run_commands, daemon=True).start()
+    last_error = None
+    while True:
+        try:
+            path = find_touchpad()
+            if path is None:
+                log("no touchpad found, retrying")
+                time.sleep(5)
+                continue
+            watch(path)
+        except OSError as e:  # no permission, or the touchpad went away (suspend)
+            if isinstance(e, PermissionError) and "/dev/uinput" in str(e):
+                e = PermissionError("can't write /dev/uinput: see 'Permissions' in the README")
+            if str(e) != last_error:
+                warn(f"{e}; retrying")
+                last_error = str(e)
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
