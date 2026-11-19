@@ -1,78 +1,13 @@
 #!/usr/bin/env python3
-"""Press a key combo through a short-lived kernel virtual keyboard (/dev/uinput).
+"""Press a key combo once, e.g.  gesture-key super+a
 
-The desktop sees these as real key presses, so its own shortcuts and media
-keys work, on Wayland and X11 alike, with no "Allow remote control?" prompt.
-No extra packages needed.
-
-Usage: gesture-key super+a   |   gesture-key alt+tab   |   gesture-key volumeup
-Keys: letters, digits, ctrl, alt, shift, super, tab, esc, enter, space, arrows
-(up/down/left/right), home, end, pageup, pagedown, delete, backspace, f1-f12,
-print, volumeup, volumedown, mute, playpause, stopcd, nextsong, previoussong,
-back, forward, minus, equal, plus, slash.
+Same as `five-finger-gestures --key super+a`. Kept for older configs and for
+use in your own scripts. In the config, use the built-in `key super+a` action
+instead. Key names: five-finger-gestures --list-keys
 """
-import fcntl, os, struct, sys, time
+import os, sys
 
-EV_SYN, EV_KEY, SYN_REPORT = 0, 1, 0
-UI_SET_EVBIT, UI_SET_KEYBIT = 0x40045564, 0x40045565
-UI_DEV_SETUP, UI_DEV_CREATE, UI_DEV_DESTROY = 0x405C5503, 0x5501, 0x5502
-BUS_USB = 0x03
-
-KEYS = {
-    "esc": 1, "escape": 1, "minus": 12, "equal": 13, "plus": 13, "backspace": 14,
-    "tab": 15, "enter": 28, "return": 28, "ctrl": 29, "control": 29,
-    "shift": 42, "alt": 56, "space": 57, "slash": 53, "super": 125, "meta": 125,
-    "home": 102, "up": 103, "pageup": 104, "left": 105, "right": 106,
-    "end": 107, "down": 108, "pagedown": 109, "delete": 111,
-    "f11": 87, "volumeup": 115, "volumedown": 114, "mute": 113,
-    "back": 158, "forward": 159, "print": 99, "f4": 62,
-    "nextsong": 163, "playpause": 164, "previoussong": 165, "stopcd": 166,
-    "f12": 88,
-}
-for i in range(10):
-    KEYS[f"f{i + 1}"] = 59 + i
-for i, c in enumerate("1234567890"):
-    KEYS[c] = 2 + i
-for row, start in (("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)):
-    for i, c in enumerate(row):
-        KEYS[c] = start + i
-
-
-def main():
-    if len(sys.argv) != 2:
-        sys.exit(__doc__)
-    try:
-        codes = [KEYS[k] for k in sys.argv[1].lower().split("+")]
-    except KeyError as e:
-        sys.exit(f"gesture-key: unknown key {e}")
-
-    fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
-    try:
-        fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
-        for code in set(KEYS.values()):
-            fcntl.ioctl(fd, UI_SET_KEYBIT, code)
-        name = b"gesture-key virtual keyboard"
-        fcntl.ioctl(fd, UI_DEV_SETUP, struct.pack("HHHH80sI", BUS_USB, 0x1234, 0x5678, 1, name, 0))
-        fcntl.ioctl(fd, UI_DEV_CREATE)
-        time.sleep(0.25)  # let the compositor pick up the new device
-
-        def emit(t, code, val):
-            os.write(fd, struct.pack("llHHi", 0, 0, t, code, val))
-
-        def press(code, val):
-            emit(EV_KEY, code, val)
-            emit(EV_SYN, SYN_REPORT, 0)
-            time.sleep(0.015)
-
-        for code in codes:
-            press(code, 1)
-        for code in reversed(codes):
-            press(code, 0)
-        time.sleep(0.05)
-        fcntl.ioctl(fd, UI_DEV_DESTROY)
-    finally:
-        os.close(fd)
-
-
-if __name__ == "__main__":
-    main()
+if len(sys.argv) != 2:
+    sys.exit(__doc__.strip())
+main = os.path.join(os.path.dirname(os.path.realpath(__file__)), "five-finger-gestures")
+os.execv(sys.executable, [sys.executable, main, "--key", sys.argv[1]])

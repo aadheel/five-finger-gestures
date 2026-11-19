@@ -77,4 +77,8 @@ fi
 # Restart it now so the new version is used.
 pkill -f "$BIN/five-finger-gestures" 2>/dev/null && sleep 0.5 || true
 nohup setsid "$BIN/five-finger-gestures" >/dev/null 2>&1 </dev/null &
-echo "Started. Try a 5-finger swipe!"
+sleep 1.5
+echo
+"$BIN/five-finger-gestures" --check || true
+echo
+echo "Edit $CONF to change gestures; check it any time with: five-finger-gestures --check"

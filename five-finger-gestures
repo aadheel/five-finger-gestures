@@ -2,37 +2,50 @@
 """five-finger-gestures: 5-finger touchpad gestures (and a 4-finger tap) on
 Linux, without also triggering the desktop's own 4-finger gestures.
 
-libinput, the touchpad driver behind GNOME, KDE and most Wayland desktops,
-reports a 5-finger swipe as a 4-finger swipe. So this program sits between
-the touchpad and the desktop: it takes the touchpad for itself and passes
-every touch through to a virtual copy of it, which the desktop uses instead.
-Touches of 1-4 fingers go through unchanged, so all normal gestures keep
-working. When a 5th finger lands, the copy's fingers are held still until the
-hand lifts, so the desktop sees no gesture, and this program runs the
-command for the 5-finger swipe, tap or pinch instead.
+Usage:
+  five-finger-gestures                 run (normally started at login)
+  five-finger-gestures --check         check config, touchpad and permissions
+  five-finger-gestures --debug         run and log every 5-finger touch
+  five-finger-gestures --key super+a   press a key combo once
+  five-finger-gestures --list-keys     show the key names for `key` actions
 
-If this program stops for any reason, the kernel hands the real touchpad
-back to the desktop and the copy disappears.
+Config: ~/.config/five-finger-gestures.conf (or --config FILE), lines like
+  swipe left    = key previoussong      # fires once when you lift
+  slide up      = key volumeup          # repeats while the fingers keep moving
+  tap           = key playpause
+  4-finger tap  = key print
+  pinch out     = notify-send "hello"   # any command
+  swipe distance = 6mm                  # settings, see --check
 
-Config: ~/.config/five-finger-gestures.conf, lines like
-    swipe up     = ~/.local/bin/gesture-key volumeup
-    tap          = ~/.local/bin/gesture-key playpause
-    4-finger tap = ~/.local/bin/gesture-key print
-Gestures: swipe up/down/left/right, tap, pinch in/out (5 fingers), 4-finger tap.
-
-Usage:  five-finger-gestures [--debug] [--device /dev/input/eventN]
+How it works: libinput, the touchpad driver behind GNOME, KDE and most
+Wayland desktops, reports a 5-finger swipe as a 4-finger swipe. So this
+program takes the touchpad for itself and passes every touch through to a
+virtual copy of it, which the desktop uses instead. Touches of 1-4 fingers go
+through unchanged. When a 5th finger lands, the copy's fingers are held still
+until the hand lifts, so the desktop sees no gesture, and this program runs
+the gesture's action instead. If this program stops for any reason, the
+kernel hands the real touchpad back to the desktop.
 """
-import fcntl, math, os, queue, select, shlex, struct, subprocess, sys, threading, time
+import argparse, difflib, fcntl, math, os, queue, re, select, shlex, shutil, struct
+import subprocess, sys, textwrap, threading, time
 
-CONFIG = os.path.expanduser("~/.config/five-finger-gestures.conf")
+DEFAULT_CONFIG = os.path.expanduser("~/.config/five-finger-gestures.conf")
 FINGERS = 5
-SWIPE_MM = 6         # how far the fingers must travel for a swipe
-PINCH_RATIO = 0.30   # how much the fingers must close/spread for a pinch (30%)
-KEEP_FINGERS = 3     # the gesture ends once fewer than this many of its fingers remain
-TAP_MM = 3           # a tap moves less than this...
-TAP_SECONDS = 0.35   # ...and lifts within this time
+KEEP_FINGERS = 3     # a gesture ends once fewer than this many of its fingers remain
 COPY_MIN_HOLD = 0.3  # the desktop's view of a held-back touch lasts at least this
                      # long, so its first 3 fingers never count as a 3-finger tap
+
+# Settings: name -> (default, unit, min, max, description)
+SETTINGS = {
+    "swipe distance": (6.0, "mm", 1, 60, "how far the fingers must move for a swipe"),
+    "slide step":     (7.0, "mm", 1, 60, "how far to move per repeat of a slide"),
+    "tap max move":   (3.0, "mm", 0.5, 20, "a tap moves less than this"),
+    "tap max time":   (0.35, "s", 0.05, 2, "a tap lifts within this time"),
+    "pinch amount":   (0.30, "%", 0.05, 0.95, "how much the fingers must close or spread"),
+}
+DIRECTIONS = ("up", "down", "left", "right")
+GESTURES = ([f"swipe {d}" for d in DIRECTIONS] + [f"slide {d}" for d in DIRECTIONS]
+            + ["tap", "pinch in", "pinch out", "4-finger tap"])
 
 EV_SYN, EV_KEY, EV_ABS, EV_MSC = 0, 1, 3, 4
 SYN_REPORT, SYN_DROPPED = 0, 3
@@ -41,7 +54,7 @@ ABS_MT_LAST = 0x3C
 BTN_LEFT, BTN_TOOL_FINGER = 0x110, 0x145
 INPUT_PROP_POINTER, INPUT_PROP_DIRECT = 0, 1
 EVENT = struct.Struct("llHHi")
-DEBUG = "--debug" in sys.argv
+DEBUG = False
 
 
 def log(*a):
@@ -51,6 +64,44 @@ def log(*a):
 
 def warn(msg):
     print(f"five-finger-gestures: {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- key names
+def build_keys():
+    keys = {}
+    for i, c in enumerate("1234567890"):
+        keys[c] = 2 + i
+    for row, start in (("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)):
+        for i, c in enumerate(row):
+            keys[c] = start + i
+    for i in range(10):
+        keys[f"f{i + 1}"] = 59 + i
+    keys.update({
+        "f11": 87, "f12": 88, "esc": 1, "minus": 12, "equal": 13, "backspace": 14,
+        "tab": 15, "leftbrace": 26, "rightbrace": 27, "enter": 28, "ctrl": 29,
+        "semicolon": 39, "apostrophe": 40, "grave": 41, "shift": 42, "backslash": 43,
+        "comma": 51, "dot": 52, "slash": 53, "alt": 56, "space": 57, "capslock": 58,
+        "print": 99, "altgr": 100, "home": 102, "up": 103, "pageup": 104, "left": 105,
+        "right": 106, "end": 107, "down": 108, "pagedown": 109, "insert": 110,
+        "delete": 111, "mute": 113, "volumedown": 114, "volumeup": 115, "super": 125,
+        "menu": 127, "calc": 140, "screenlock": 152, "mail": 155, "back": 158,
+        "forward": 159, "nextsong": 163, "playpause": 164, "previoussong": 165,
+        "stopcd": 166, "homepage": 172, "search": 217, "brightnessdown": 224,
+        "brightnessup": 225, "kbdillumdown": 229, "kbdillumup": 230, "micmute": 248,
+    })
+    aliases = {
+        "escape": "esc", "return": "enter", "control": "ctrl", "meta": "super",
+        "win": "super", "plus": "equal", "period": "dot", "del": "delete",
+        "pgup": "pageup", "pgdn": "pagedown", "printscreen": "print", "prtsc": "print",
+        "next": "nextsong", "previous": "previoussong", "prev": "previoussong",
+        "play": "playpause", "stop": "stopcd", "lock": "screenlock",
+    }
+    for alias, name in aliases.items():
+        keys[alias] = keys[name]
+    return keys
+
+
+KEYS = build_keys()
 
 
 # ---------------------------------------------------------------- ioctls
@@ -89,6 +140,12 @@ def mt_values(fd, code, n):
     return list(struct.unpack_from(f"{n}i", buf, 4))
 
 
+def device_name(fd):
+    name = bytearray(80)
+    fcntl.ioctl(fd, ior(0x06, 80), name)  # EVIOCGNAME
+    return bytes(name).split(b"\0", 1)[0].decode(errors="replace")
+
+
 def make_copy(fd):
     """Create a virtual touchpad identical to the real one (same name and IDs,
     so the driver applies the same settings and quirks)."""
@@ -109,9 +166,8 @@ def make_copy(fd):
             fcntl.ioctl(ui, UI_ABS_SETUP, struct.pack("=H2x6i", code, *absinfo(fd, code)))
         ids = bytearray(8)
         fcntl.ioctl(fd, ior(0x02, 8), ids)  # EVIOCGID
-        name = bytearray(80)
-        fcntl.ioctl(fd, ior(0x06, 80), name)  # EVIOCGNAME
-        fcntl.ioctl(ui, UI_DEV_SETUP, struct.pack("=8s80sI", bytes(ids), bytes(name[:79]), 0))
+        name = device_name(fd).encode()[:79]
+        fcntl.ioctl(ui, UI_DEV_SETUP, struct.pack("=8s80sI", bytes(ids), name, 0))
         fcntl.ioctl(ui, UI_DEV_CREATE)
     except Exception:
         os.close(ui)
@@ -119,11 +175,40 @@ def make_copy(fd):
     return ui
 
 
+class Keyboard:
+    """A virtual keyboard for `key` actions. The desktop sees real key presses,
+    so its own shortcuts and media keys work, with no "remote control" prompt."""
+
+    def __init__(self):
+        self.fd = os.open("/dev/uinput", os.O_WRONLY)
+        try:
+            fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+            for code in set(KEYS.values()):
+                fcntl.ioctl(self.fd, UI_SET_KEYBIT, code)
+            fcntl.ioctl(self.fd, UI_DEV_SETUP, struct.pack(
+                "=4H80sI", 0x03, 0x1234, 0x5678, 1, b"five-finger-gestures keyboard", 0))
+            fcntl.ioctl(self.fd, UI_DEV_CREATE)
+        except Exception:
+            os.close(self.fd)
+            raise
+        time.sleep(0.3)  # let the desktop pick up the new keyboard
+
+    def press(self, codes):
+        for code, value in [(c, 1) for c in codes] + [(c, 0) for c in reversed(codes)]:
+            os.write(self.fd, EVENT.pack(0, 0, EV_KEY, code, value)
+                     + EVENT.pack(0, 0, EV_SYN, SYN_REPORT, 0))
+            time.sleep(0.01)
+
+    def close(self):
+        try:
+            fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+        finally:
+            os.close(self.fd)
+
+
 def find_touchpad():
-    if "--device" in sys.argv:
-        return sys.argv[sys.argv.index("--device") + 1]
-    # A touchpad: a multitouch pointer device (not a touchscreen) that reports
-    # finger counts. Virtual devices (like our own copy) are skipped.
+    """The first touchpad: a multitouch pointer device (not a touchscreen) that
+    reports finger counts. Virtual devices (like our own copy) are skipped."""
     unreadable = False
     for node in sorted(os.listdir("/dev/input"), key=lambda s: (len(s), s)):
         if not node.startswith("event"):
@@ -153,52 +238,180 @@ def find_touchpad():
     return None
 
 
-# ---------------------------------------------------------------- gestures
-def load_config():
-    actions = {}
+# ---------------------------------------------------------------- config
+def format_setting(name, value):
+    unit = SETTINGS[name][1]
+    if unit == "%":
+        return f"{value * 100:g}%"
+    return f"{value:g}{unit}"
+
+
+def parse_setting(name, text):
+    default, unit, lo, hi, _ = SETTINGS[name]
+    m = re.fullmatch(r"(\d+(?:\.\d*)?|\.\d+)\s*(mm|ms|s|%)?", text.strip().lower())
+    if not m:
+        raise ValueError(f"'{text}' isn't a value like {format_setting(name, default)}")
+    num, given = float(m.group(1)), m.group(2)
+    if unit == "s" and given == "ms":
+        num /= 1000
+    elif unit == "%":
+        if given not in (None, "%"):
+            raise ValueError(f"use a percentage, like {format_setting(name, default)}")
+        num /= 100
+    elif given not in (None, unit):
+        raise ValueError(f"use {unit}, like {format_setting(name, default)}")
+    if not lo <= num <= hi:
+        raise ValueError(f"must be between {format_setting(name, lo)} and {format_setting(name, hi)}")
+    return num
+
+
+def parse_action(text):
+    """'key super+a' -> ('key', [codes], text); anything else is a command."""
+    words = text.split(None, 1)
+    if words and words[0].lower() == "key":
+        if len(words) < 2:
+            raise ValueError("'key' needs a key combo, like: key super+a")
+        codes = []
+        for name in words[1].lower().replace(" ", "").split("+"):
+            if name not in KEYS:
+                close = difflib.get_close_matches(name, KEYS, 1)
+                hint = f" (did you mean '{close[0]}'?)" if close else " (see --list-keys)"
+                raise ValueError(f"unknown key '{name}'{hint}")
+            codes.append(KEYS[name])
+        return ("key", codes, text)
+    if not text:
+        raise ValueError("no action given")
+    shlex.split(text)  # raises ValueError on bad quoting
+    return ("run", text, text)
+
+
+def load_config(path):
+    """Returns (settings, actions, problems); problems are (line number, message)."""
+    settings = {name: spec[0] for name, spec in SETTINGS.items()}
+    actions, problems = {}, []
     try:
-        with open(CONFIG) as f:
-            for line in f:
-                line = line.split("#", 1)[0].strip()
-                if "=" in line:
-                    key, cmd = line.split("=", 1)
-                    actions[" ".join(key.lower().split())] = cmd.strip()
+        with open(path) as f:
+            lines = f.read().splitlines()
     except FileNotFoundError:
-        warn(f"{CONFIG} not found")
-    return actions
+        return settings, actions, [(0, f"{path} not found")]
+    for n, raw in enumerate(lines, 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" not in line:
+            problems.append((n, f"expected 'name = value', got '{line}'"))
+            continue
+        name, value = (part.strip() for part in line.split("=", 1))
+        name = " ".join(name.lower().split())
+        try:
+            if name in SETTINGS:
+                settings[name] = parse_setting(name, value)
+            elif name in GESTURES:
+                actions[name] = parse_action(value)
+            else:
+                close = difflib.get_close_matches(name, GESTURES + list(SETTINGS), 1)
+                hint = f" (did you mean '{close[0]}'?)" if close else ""
+                problems.append((n, f"unknown gesture or setting '{name}'{hint}"))
+        except ValueError as e:
+            problems.append((n, f"{name}: {e}"))
+    for d in DIRECTIONS:
+        if f"swipe {d}" in actions and f"slide {d}" in actions:
+            problems.append((0, f"'swipe {d}' never fires because 'slide {d}' is set"))
+    return settings, actions, problems
 
 
-def classify(dx, dy, ratio, actions):
+class Config:
+    """The config file, re-read whenever it changes."""
+
+    def __init__(self, path):
+        self.path, self.mtime = path, None
+        self.reload()
+
+    def reload(self):
+        try:
+            mtime = os.path.getmtime(self.path)
+        except OSError:
+            mtime = 0
+        if mtime == self.mtime:
+            return
+        self.mtime = mtime
+        self.settings, self.actions, problems = load_config(self.path)
+        for n, msg in problems:
+            warn(f"{self.path}:{n}: {msg}" if n else msg)
+
+
+def classify(dx, dy, ratio, settings, actions):
     pinch = "pinch out" if ratio > 1 else "pinch in"
-    pinched = abs(ratio - 1) >= PINCH_RATIO
+    pinched = abs(ratio - 1) >= settings["pinch amount"]
     # A pinch only wins over a swipe if it has an action, so fingers that
     # spread a little during a swipe don't swallow it.
-    if pinched and pinch in actions and math.hypot(dx, dy) < 2 * SWIPE_MM:
+    if pinched and pinch in actions and math.hypot(dx, dy) < 2 * settings["swipe distance"]:
         return pinch
-    if max(abs(dx), abs(dy)) >= SWIPE_MM:
+    if max(abs(dx), abs(dy)) >= settings["swipe distance"]:
         if abs(dx) > abs(dy):
             return "swipe right" if dx > 0 else "swipe left"
         return "swipe down" if dy > 0 else "swipe up"
     return pinch if pinched else None
 
 
-# Commands run one at a time (each gets up to 2 s), so the key presses of two
-# quick gestures never overlap. The touchpad loop never waits on them.
-commands = queue.Queue()
+class Slide:
+    """Slide gestures: once the fingers have moved one step along an axis that
+    has a slide action, fire one action per step, either way along it."""
+
+    def __init__(self):
+        self.axis, self.last, self.fired = None, 0.0, False
+
+    def update(self, dx, dy, settings, actions, fire):
+        step = settings["slide step"]
+        if self.axis is None:
+            if max(abs(dx), abs(dy)) < step:
+                return
+            axis = "x" if abs(dx) > abs(dy) else "y"
+            names = ("slide right", "slide left") if axis == "x" else ("slide up", "slide down")
+            self.axis = axis if any(n in actions for n in names) else "none"
+        if self.axis == "none":
+            return
+        forward, backward = (("slide right", "slide left") if self.axis == "x"
+                             else ("slide up", "slide down"))
+        pos = dx if self.axis == "x" else -dy  # up is negative y on a touchpad
+        while pos - self.last >= step:
+            self.last += step
+            self.fired |= fire(forward)
+        while self.last - pos >= step:
+            self.last -= step
+            self.fired |= fire(backward)
 
 
-def run_commands():
-    running = []
+# ---------------------------------------------------------------- actions
+# Actions run one at a time in a worker thread, so key presses never overlap
+# and the touchpad loop never waits on them.
+pending = queue.Queue()
+
+
+def run_actions():
+    keyboard, running = None, []
+    try:
+        keyboard = Keyboard()
+    except OSError as e:
+        warn(f"no virtual keyboard yet ({e}); will retry on the first key action")
     while True:
-        cmd = commands.get()
+        kind, what, text = pending.get()
+        if kind == "key":
+            try:
+                if keyboard is None:
+                    keyboard = Keyboard()
+                keyboard.press(what)
+            except OSError as e:
+                warn(f"can't press '{text}': {e}")
+            continue
         running = [p for p in running if p.poll() is None]  # reap finished ones
         try:
-            args = [os.path.expanduser(os.path.expandvars(a)) for a in shlex.split(cmd)]
+            args = [os.path.expanduser(os.path.expandvars(a)) for a in shlex.split(what)]
             quiet = None if DEBUG else subprocess.DEVNULL
             p = subprocess.Popen(args, start_new_session=True,
                                  stdin=subprocess.DEVNULL, stdout=quiet, stderr=quiet)
         except Exception as e:
-            warn(f"can't run {cmd!r}: {e}")
+            warn(f"can't run '{text}': {e}")
             continue
         running.append(p)
         try:
@@ -208,7 +421,7 @@ def run_commands():
 
 
 # ---------------------------------------------------------------- main loop
-def watch(path):
+def watch(path, cfg):
     fd = os.open(path, os.O_RDONLY)
     ui = None
     try:
@@ -220,9 +433,6 @@ def watch(path):
             sys.exit(1)
         mt_codes = [c for c in bits(fd, 0x20 + EV_ABS, 0x3F) if ABS_MT_SLOT < c <= ABS_MT_LAST]
         st_codes = [c for c in bits(fd, 0x20 + EV_ABS, 0x3F) if c < ABS_MT_SLOT]
-
-        actions = load_config()
-        config_mtime = os.path.getmtime(CONFIG) if os.path.exists(CONFIG) else 0
 
         # Mirror of the real touchpad's state.
         slot = 0
@@ -295,12 +505,12 @@ def watch(path):
             s1 = sum(math.hypot((mt[i][ABS_MT_X] - cx) / res_x, (mt[i][ABS_MT_Y] - cy) / res_y) for i in still)
             return (cx - sx) / res_x, (cy - sy) / res_y, (s1 / s0 if s0 else 1.0)
 
-        def current_actions():
-            nonlocal actions, config_mtime
-            mtime = os.path.getmtime(CONFIG) if os.path.exists(CONFIG) else 0
-            if mtime != config_mtime:  # pick up config edits without a restart
-                actions, config_mtime = load_config(), mtime
-            return actions
+        def fire(name):
+            action = cfg.actions.get(name)
+            log(f"{name} -> {action[2] if action else '(nothing set)'}")
+            if action:
+                pending.put(action)
+            return bool(action)
 
         resync()
         ui = make_copy(fd)
@@ -310,7 +520,7 @@ def watch(path):
 
         holding = any(i != -1 for i in ids())  # pass nothing until the pad is empty
         gesture, gesture_t0 = None, 0.0  # slot -> (tracking id, start x, start y)
-        moved = (0.0, 0.0, 1.0)
+        moved, slide = (0.0, 0.0, 1.0), Slide()
         tap4, tap4_done = None, holding  # possible 4-finger tap in progress
         tap4_moved, tap4_t0 = (0.0, 0.0, 1.0), 0.0
         frame, frame_slot = [], slot
@@ -354,25 +564,29 @@ def watch(path):
                 # --- one complete touchpad frame ---
                 now = ids()
                 n = sum(1 for i in now if i != -1)
+                s = cfg.settings
 
                 # 5 fingers: follow the gesture until the hand lifts.
                 if gesture is not None:
                     still = [i for i, (tid, _, _) in gesture.items() if now[i] == tid]
                     if len(still) >= KEEP_FINGERS:
                         moved = measure(gesture, still)
+                        slide.update(moved[0], moved[1], s, cfg.actions, fire)
                     else:  # the hand has lifted: decide what it was
                         gesture = None
                         dx, dy, ratio = moved
-                        acts = current_actions()
-                        name = classify(dx, dy, ratio, acts)
-                        took = time.monotonic() - gesture_t0
-                        if name is None and math.hypot(dx, dy) < TAP_MM and took < TAP_SECONDS:
-                            name = "tap"
-                        cmd = acts.get(name) if name else None
-                        log(f"moved dx={dx:+.1f}mm dy={dy:+.1f}mm spread x{ratio:.2f}"
-                            f" -> {name or '(too small)'} -> {cmd or '(nothing)'}")
-                        if cmd:
-                            commands.put(cmd)
+                        log(f"moved dx={dx:+.1f}mm dy={dy:+.1f}mm spread x{ratio:.2f}")
+                        if not slide.fired:
+                            name = classify(dx, dy, ratio, s, cfg.actions)
+                            if name and name.startswith("swipe ") and \
+                                    "slide " + name[6:] in cfg.actions:
+                                name = None  # that direction is a slide
+                            took = time.monotonic() - gesture_t0
+                            if name is None and math.hypot(dx, dy) < s["tap max move"] \
+                                    and took < s["tap max time"]:
+                                name = "tap"
+                            if name:
+                                fire(name)
 
                 # 4-finger tap: the desktop ignores those, so just watch.
                 if tap4 is not None:
@@ -387,12 +601,10 @@ def watch(path):
                             dx, dy, _ = tap4_moved
                             took = time.monotonic() - tap4_t0
                             tap4, tap4_done = None, True
-                            if math.hypot(dx, dy) < TAP_MM and took < TAP_SECONDS:
-                                cmd = current_actions().get("4-finger tap")
-                                log(f"4-finger tap -> {cmd or '(nothing)'}")
-                                if cmd:
-                                    commands.put(cmd)
+                            if math.hypot(dx, dy) < s["tap max move"] and took < s["tap max time"]:
+                                fire("4-finger tap")
                 elif not holding and not tap4_done and n == 4:
+                    cfg.reload()
                     tap4 = {i: (now[i], mt[i][ABS_MT_X], mt[i][ABS_MT_Y])
                             for i in range(nslots) if now[i] != -1}
                     tap4_moved, tap4_t0 = (0.0, 0.0, 1.0), time.monotonic()
@@ -402,9 +614,10 @@ def watch(path):
                 if not holding and n >= FINGERS:
                     # 5th finger: freeze what the desktop sees until the hand lifts
                     holding = True
+                    cfg.reload()  # pick up config edits without a restart
                     gesture = {i: (now[i], mt[i][ABS_MT_X], mt[i][ABS_MT_Y])
                                for i in range(nslots) if now[i] != -1}
-                    moved, gesture_t0 = (0.0, 0.0, 1.0), time.monotonic()
+                    moved, slide, gesture_t0 = (0.0, 0.0, 1.0), Slide(), time.monotonic()
                     log(f"{n} fingers down")
                 elif holding:
                     if n == 0:
@@ -423,29 +636,29 @@ def watch(path):
         os.close(fd)  # also releases the grab
 
 
-def main():
-    if "-h" in sys.argv or "--help" in sys.argv:
-        print(__doc__.strip())
-        return
+def lock_path():
+    return os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "five-finger-gestures.lock")
 
-    # Only one copy at a time.
-    lock = open(os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "five-finger-gestures.lock"), "w")
+
+def run(config_path, device):
+    lock = open(lock_path(), "w")  # only one copy at a time
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         warn("already running")
         sys.exit(1)
 
-    threading.Thread(target=run_commands, daemon=True).start()
+    cfg = Config(config_path)
+    threading.Thread(target=run_actions, daemon=True).start()
     last_error = None
     while True:
         try:
-            path = find_touchpad()
+            path = device or find_touchpad()
             if path is None:
                 log("no touchpad found, retrying")
                 time.sleep(5)
                 continue
-            watch(path)
+            watch(path, cfg)
         except OSError as e:  # no permission, or the touchpad went away (suspend)
             if isinstance(e, PermissionError) and "/dev/uinput" in str(e):
                 e = PermissionError("can't write /dev/uinput: see 'Permissions' in the README")
@@ -455,8 +668,125 @@ def main():
             time.sleep(3)
 
 
+# ---------------------------------------------------------------- commands
+def check(config_path, device):
+    """Print what the config does and whether everything needed is in place."""
+    ok = True
+    settings, actions, problems = load_config(config_path)
+    print(f"Config: {config_path}\n\nGestures:")
+    for g in GESTURES:
+        if g in actions:
+            kind, what, text = actions[g]
+            note = ""
+            if kind == "run":
+                exe = os.path.expanduser(os.path.expandvars(shlex.split(what)[0]))
+                if not shutil.which(exe):
+                    note, ok = "   <- command not found", False
+            print(f"  {g:<14} {text}{note}")
+        else:
+            print(f"  {g:<14} -")
+    print("\nSettings:")
+    for name, (default, _, _, _, desc) in SETTINGS.items():
+        value = format_setting(name, settings[name])
+        mark = "" if settings[name] == default else " (changed)"
+        print(f"  {name:<15} {value + mark:<16} {desc}")
+    if problems:
+        ok = False
+        print("\nProblems in the config:")
+        for n, msg in problems:
+            print(f"  line {n}: {msg}" if n else f"  {msg}")
+
+    print("\nSystem:")
+    path, error = None, None
+    try:
+        path = device or find_touchpad()
+    except PermissionError as e:
+        error = e
+    if error:
+        ok = False
+        print(f"  ✗ {error}")
+    elif not path:
+        ok = False
+        print("  ✗ no touchpad found")
+    else:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                slots = absinfo(fd, ABS_MT_SLOT)[2] + 1
+                name = device_name(fd)
+            finally:
+                os.close(fd)
+            good = slots >= FINGERS
+            ok &= good
+            print(f"  {'✓' if good else '✗'} touchpad {path} ({name}) tracks {slots} fingers")
+        except OSError as e:
+            ok = False
+            print(f"  ✗ can't open {path}: {e}")
+    uinput = os.access("/dev/uinput", os.W_OK)
+    ok &= uinput
+    print(f"  {'✓' if uinput else '✗'} /dev/uinput is {'writable' if uinput else 'not writable (see Permissions in the README)'}")
+    try:
+        with open(lock_path(), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            print("  - five-finger-gestures is not running")
+    except OSError:
+        print("  ✓ five-finger-gestures is running (config changes apply on the next gesture)")
+    print("\nAll good." if ok else "\nSome things need fixing (see above).")
+    return 0 if ok else 1
+
+
+def press_once(combo):
+    try:
+        _, codes, _ = parse_action(f"key {combo}")
+    except ValueError as e:
+        warn(str(e))
+        return 1
+    try:
+        keyboard = Keyboard()
+    except OSError as e:
+        warn(f"can't create a virtual keyboard: {e}")
+        return 1
+    try:
+        keyboard.press(codes)
+        time.sleep(0.05)
+    finally:
+        keyboard.close()
+    return 0
+
+
+def list_keys():
+    names = sorted(KEYS, key=lambda k: (len(k) > 1, re.sub(r"\d+", lambda m: m[0].zfill(3), k)))
+    print("Key names for `key` actions (combine with +, e.g. key ctrl+shift+t):\n")
+    print(textwrap.fill(", ".join(names), width=78))
+    return 0
+
+
+def main():
+    global DEBUG
+    parser = argparse.ArgumentParser(
+        prog="five-finger-gestures", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__.split("\n\n", 1)[0],
+        epilog="Config file format and examples: see the README or --check.")
+    parser.add_argument("--check", action="store_true", help="check the config, touchpad and permissions")
+    parser.add_argument("--debug", action="store_true", help="log every 5-finger touch and gesture")
+    parser.add_argument("--key", metavar="COMBO", help="press a key combo once, e.g. super+a")
+    parser.add_argument("--list-keys", action="store_true", help="show key names for `key` actions")
+    parser.add_argument("--config", metavar="FILE", default=DEFAULT_CONFIG,
+                        help="config file (default: ~/.config/five-finger-gestures.conf)")
+    parser.add_argument("--device", metavar="PATH", help="touchpad device, e.g. /dev/input/event5")
+    args = parser.parse_args()
+    DEBUG = args.debug
+    if args.check:
+        return check(args.config, args.device)
+    if args.list_keys:
+        return list_keys()
+    if args.key:
+        return press_once(args.key)
+    run(args.config, args.device)
+
+
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except KeyboardInterrupt:
         pass

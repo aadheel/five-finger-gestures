@@ -5,18 +5,17 @@ trigger your desktop's 4-finger gestures**.
 
 | Gesture (default config) | Does |
 |---|---|
+| 5-finger slide up / down | Volume up / down, step by step as you slide |
 | 5-finger swipe left / right | Previous / next song |
-| 5-finger swipe up / down | Volume up / down |
 | 5-finger tap | Play / pause |
 | 4-finger tap | Screenshot tool |
 | 5-finger pinch in / out | Nothing by default — add your own |
 
-Every gesture runs whatever command you put in the config file. Your normal
-1–4 finger gestures (scrolling, workspace swipes, overview, …) keep working
-exactly as before.
+Every gesture can press any key combo or run any command, and the sensitivity
+is adjustable, all from one config file. Your normal 1–4 finger gestures
+(scrolling, workspace swipes, overview, …) keep working exactly as before.
 
-Pure Python 3 standard library, no dependencies, about 400 lines. Works on
-Wayland and X11.
+Pure Python 3 standard library, no dependencies. Works on Wayland and X11.
 
 ## Why this exists
 
@@ -37,7 +36,7 @@ can't stop the desktop from also acting on the swipe it saw as 4 fingers.
 3. Every touch with 1–4 fingers is passed through to the copy unchanged.
 4. When a 5th finger lands, the copy's fingers are frozen until the hand
    lifts. The desktop sees fingers resting, not a gesture. The program follows
-   each finger, measures the swipe, pinch or tap, and runs your command.
+   each finger, measures the swipe, slide, pinch or tap, and runs your action.
    Fingers that the touchpad drops mid-swipe don't spoil the measurement.
 5. A 4-finger tap is passed through as usual (libinput ignores 4-finger taps)
    and just watched for.
@@ -48,7 +47,7 @@ removes the copy, so your touchpad simply goes back to normal.
 ## Requirements
 
 - Linux with a touchpad that tracks 5 fingers (most modern precision
-  touchpads do; the program tells you if yours doesn't).
+  touchpads do; `--check` tells you if yours doesn't).
 - Python 3.6+.
 - Permission to read the touchpad: be in the `input` group.
 - Permission to write `/dev/uinput`. Many distros already grant this to the
@@ -75,27 +74,66 @@ after that, log out and back in.
 ## Configure
 
 Edit `~/.config/five-finger-gestures.conf`. Changes apply on the next
-gesture, no restart needed.
+gesture, no restart needed. Then run `five-finger-gestures --check` to see
+what each gesture does and catch typos.
 
 ```ini
-swipe up     = ~/.local/bin/gesture-key volumeup
-swipe right  = x-terminal-emulator
-tap          = ~/.local/bin/gesture-key playpause
-pinch out    = ~/.local/bin/gesture-key super+a
-4-finger tap = ~/.local/bin/gesture-key print
+slide up     = key volumeup         # repeats while you keep sliding
+slide down   = key volumedown
+swipe left   = key previoussong     # once, when you lift
+swipe right  = key nextsong
+tap          = key playpause
+pinch out    = key super+a
+4-finger tap = key print
+
+slide step   = 7mm                  # settings
 ```
 
-Gesture names: `swipe up`, `swipe down`, `swipe left`, `swipe right`, `tap`,
-`pinch in`, `pinch out` (all 5-finger), and `4-finger tap`.
+### Gestures
 
-`gesture-key` presses a key combination through a virtual keyboard, so it
-triggers your desktop's own shortcuts and media keys without any
-"allow remote control" prompt. Run `gesture-key` with no arguments to see the
-supported key names (letters, digits, modifiers, arrows, F1–F12, media and
-volume keys, Print, …).
+| Name | When it fires |
+|---|---|
+| `swipe up/down/left/right` | Once, when you lift your 5 fingers |
+| `slide up/down/left/right` | Every *slide step* while your 5 fingers keep moving. Moving back the other way fires the opposite slide, like dragging a slider |
+| `tap` | 5 fingers land and lift quickly without moving |
+| `pinch in` / `pinch out` | 5 fingers close together / spread apart |
+| `4-finger tap` | 4 fingers land and lift quickly (4-finger swipes stay with your desktop) |
 
-Thresholds such as the minimum swipe distance (6 mm) and the maximum tap time
-(0.35 s) are constants at the top of `five-finger-gestures`.
+Use either `swipe` or `slide` for a direction, not both: if a slide is set,
+the swipe in that direction is ignored.
+
+### Actions
+
+- `key <combo>` presses keys, e.g. `key super+a`, `key ctrl+shift+t`,
+  `key brightnessup`. The desktop sees real key presses, so its own shortcuts
+  and media keys work, with no "allow remote control" prompt. See all key
+  names with `five-finger-gestures --list-keys`. Letters follow US key
+  positions.
+- Anything else runs as a command, e.g. `notify-send "hi"`,
+  `x-terminal-emulator`, `pactl set-sink-volume @DEFAULT_SINK@ +2%`.
+  `~` and `$VARS` are expanded; there's no shell, so wrap pipes in
+  `sh -c "…"`.
+
+### Settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `swipe distance` | `6mm` | How far the fingers must move for a swipe |
+| `slide step` | `7mm` | How far to move per repeat of a slide |
+| `tap max move` | `3mm` | A tap moves less than this |
+| `tap max time` | `0.35s` | A tap lifts within this time (`350ms` works too) |
+| `pinch amount` | `30%` | How much the fingers must close or spread |
+
+## Commands
+
+```sh
+five-finger-gestures --check        # what each gesture does, config problems, permissions
+five-finger-gestures --debug        # run in the foreground and log every 5-finger touch
+five-finger-gestures --list-keys    # key names for `key` actions
+five-finger-gestures --key super+a  # press a key combo once (same as: gesture-key super+a)
+five-finger-gestures --config FILE  # use another config file
+five-finger-gestures --device /dev/input/eventN   # pick the touchpad
+```
 
 ## Troubleshooting
 
@@ -107,7 +145,7 @@ five-finger-gestures --debug
 ```
 
 It logs every 5-finger touch with how far the fingers moved and which gesture
-and command it chose. Press Ctrl+C to stop, then start it again with
+and action it chose. Press Ctrl+C to stop, then start it again with
 `setsid -f five-finger-gestures` or by logging in again.
 
 If your touchpad ever misbehaves, `pkill -f five-finger-gestures` gives the
@@ -117,9 +155,17 @@ Notes:
 
 - Your touchpad shows up twice in device lists (`libinput list-devices`,
   `xinput`): the real one, which the program holds, and the virtual copy
-  that your desktop uses.
+  that your desktop uses. There's also a "five-finger-gestures keyboard" for
+  `key` actions.
 - With several touchpads, the first one found is used; pick another with
-  `--device /dev/input/eventN`.
+  `--device`.
+
+## Development
+
+`python3 tests/test_gestures.py` runs an end-to-end test without a real
+touchpad: it creates a fake touchpad, runs a test instance on it and checks
+the swipes, slides, taps and pinches it recognises. Your real touchpad and
+running copy aren't affected.
 
 ## Uninstall
 
