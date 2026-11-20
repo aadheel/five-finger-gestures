@@ -1,0 +1,52 @@
+name: Works on my laptop / doesn't
+description: Tell us how five-finger-gestures runs on your distro, desktop and touchpad
+title: "[Device] <laptop model> – <distro> – <desktop>"
+labels: ["device report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! Every report goes into the "Tested on" table in the README.
+  - type: dropdown
+    id: works
+    attributes:
+      label: Does it work?
+      options:
+        - "Yes, everything works"
+        - "Partly (say what doesn't below)"
+        - "No"
+    validations:
+      required: true
+  - type: input
+    id: laptop
+    attributes:
+      label: Laptop model
+      placeholder: "Dell XPS 13 9320"
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distro and version
+      placeholder: "Fedora 41"
+    validations:
+      required: true
+  - type: input
+    id: desktop
+    attributes:
+      label: Desktop and session
+      placeholder: "KDE Plasma 6.2, Wayland"
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of `five-finger-gestures --check`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Which gestures worked, anything odd, settings you changed.

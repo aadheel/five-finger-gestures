@@ -1,0 +1,15 @@
+post_install() {
+    cat <<MSG
+==> five-finger-gestures: one more step.
+    It needs to read your touchpad, so add yourself to the input group:
+        sudo usermod -aG input \$USER
+    then log out and back in. It starts automatically at login.
+    To change gestures:
+        cp /etc/five-finger-gestures.conf ~/.config/
+    and edit the copy. Check everything with: five-finger-gestures --check
+MSG
+}
+
+post_upgrade() {
+    echo "==> Log out and back in (or restart five-finger-gestures) to use the new version."
+}

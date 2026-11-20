@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Ideas and questions
+    url: https://github.com/aadheel/five-finger-gestures/discussions
+    about: Gesture ideas, config help and general questions

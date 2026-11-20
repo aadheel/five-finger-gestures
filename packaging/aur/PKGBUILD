@@ -1,0 +1,35 @@
+# Maintainer: aadheel <250292080+aadheel@users.noreply.github.com>
+pkgname=five-finger-gestures
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="5-finger touchpad gestures that don't also trigger your desktop's 4-finger gestures"
+arch=('any')
+url="https://github.com/aadheel/five-finger-gestures"
+license=('MIT')
+depends=('python')
+backup=('etc/five-finger-gestures.conf')
+install=five-finger-gestures.install
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 five-finger-gestures "$pkgdir/usr/bin/five-finger-gestures"
+    install -Dm755 gesture-key "$pkgdir/usr/bin/gesture-key"
+    install -Dm644 five-finger-gestures.conf "$pkgdir/etc/five-finger-gestures.conf"
+    install -Dm644 /dev/stdin "$pkgdir/etc/xdg/autostart/five-finger-gestures.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Five-finger gestures
+Comment=5-finger touchpad gestures (settings: ~/.config/five-finger-gestures.conf)
+Exec=/usr/bin/five-finger-gestures
+NoDisplay=true
+Terminal=false
+X-GNOME-Autostart-enabled=true
+DESKTOP
+    install -Dm644 /dev/stdin "$pkgdir/usr/lib/udev/rules.d/70-five-finger-gestures-uinput.rules" <<RULE
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+RULE
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -29,7 +29,9 @@ kernel hands the real touchpad back to the desktop.
 import argparse, difflib, fcntl, math, os, queue, re, select, shlex, shutil, struct
 import subprocess, sys, textwrap, threading, time
 
+__version__ = "1.0.0"
 DEFAULT_CONFIG = os.path.expanduser("~/.config/five-finger-gestures.conf")
+SYSTEM_CONFIG = "/etc/five-finger-gestures.conf"  # used while the user has none
 FINGERS = 5
 KEEP_FINGERS = 3     # a gesture ends once fewer than this many of its fingers remain
 COPY_MIN_HOLD = 0.3  # the desktop's view of a held-back touch lasts at least this
@@ -767,15 +769,20 @@ def main():
         prog="five-finger-gestures", formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__.split("\n\n", 1)[0],
         epilog="Config file format and examples: see the README or --check.")
+    parser.add_argument("--version", action="version", version="%(prog)s " + __version__)
     parser.add_argument("--check", action="store_true", help="check the config, touchpad and permissions")
     parser.add_argument("--debug", action="store_true", help="log every 5-finger touch and gesture")
     parser.add_argument("--key", metavar="COMBO", help="press a key combo once, e.g. super+a")
     parser.add_argument("--list-keys", action="store_true", help="show key names for `key` actions")
-    parser.add_argument("--config", metavar="FILE", default=DEFAULT_CONFIG,
-                        help="config file (default: ~/.config/five-finger-gestures.conf)")
+    parser.add_argument("--config", metavar="FILE",
+                        help="config file (default: ~/.config/five-finger-gestures.conf,"
+                             " or %s if that doesn't exist)" % SYSTEM_CONFIG)
     parser.add_argument("--device", metavar="PATH", help="touchpad device, e.g. /dev/input/event5")
     args = parser.parse_args()
     DEBUG = args.debug
+    if args.config is None:
+        use_system = not os.path.exists(DEFAULT_CONFIG) and os.path.exists(SYSTEM_CONFIG)
+        args.config = SYSTEM_CONFIG if use_system else DEFAULT_CONFIG
     if args.check:
         return check(args.config, args.device)
     if args.list_keys:

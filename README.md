@@ -1,7 +1,13 @@
 # five-finger-gestures
 
-5-finger touchpad gestures for Linux, plus a 4-finger tap, that **don't also
-trigger your desktop's 4-finger gestures**.
+**Real 5-finger touchpad gestures on Linux, kept separate from your 4-finger
+gestures.** Swipe five fingers to skip a song while four fingers still switch
+workspaces. Also adds a 4-finger tap.
+
+[![Latest release](https://img.shields.io/github/v/release/aadheel/five-finger-gestures)](https://github.com/aadheel/five-finger-gestures/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+![Python 3.6+, no dependencies](https://img.shields.io/badge/python-3.6%2B%2C%20no%20dependencies-informational)
+![Wayland and X11](https://img.shields.io/badge/Wayland%20%26%20X11-supported-success)
 
 | Gesture (default config) | Does |
 |---|---|
@@ -25,6 +31,22 @@ swipe (one finger is usually taken for a resting thumb). Gesture tools such as
 libinput-gestures, Fusuma or Touchegg read libinput's gesture events, so they
 can't tell 4 fingers from 5. And even a tool that reads the touchpad directly
 can't stop the desktop from also acting on the swipe it saw as 4 fingers.
+
+### Compared to other tools
+
+| | five-finger-gestures | libinput-gestures | Fusuma | Touchégg |
+|---|---|---|---|---|
+| Tells 5 fingers from 4 | **Yes** | No | No | No |
+| 5-finger gestures leave the desktop's 4-finger gestures alone | **Yes** | No | No | No |
+| Presses keys on Wayland with no extra tools | Yes (own virtual keyboard) | No (xdotool / ydotool) | No (ydotool) | Depends on desktop |
+| 3- and 4-finger swipes and pinches | No (left to your desktop) | Yes | Yes | Yes |
+| Language / dependencies | Python 3, nothing else | Python 3, libinput-tools | Ruby | C++ daemon |
+
+All of them read libinput's gesture events except this one, which reads the
+touchpad itself; that is what makes the 5-finger difference possible.
+
+The tools work well together: use your desktop or one of the others for
+3- and 4-finger gestures, and this one for 5 fingers.
 
 ## How it works
 
@@ -54,8 +76,24 @@ removes the copy, so your touchpad simply goes back to normal.
   logged-in user (Steam's udev rules do, for example). `install.sh` checks
   and offers to add a udev rule if needed.
 
-Tested on Pop!\_OS 24.04 with GNOME 46 (Wayland) on a Dell laptop. Reports from
-other desktops and touchpads are welcome.
+### Tested on
+
+| Distro | Desktop | Laptop / touchpad | Works |
+|---|---|---|---|
+| Pop!\_OS 24.04 | GNOME 46, Wayland | Dell, DELL0CAA 27C6:0D53 (Goodix) | Yes |
+
+Tried it somewhere else? Please
+[add your laptop](https://github.com/aadheel/five-finger-gestures/issues/new?template=device-report.yml),
+whether it worked or not. It takes a minute and helps the next person.
+
+### Is it safe?
+
+It's one readable Python file with no dependencies and no network access. It
+needs to read your touchpad (the `input` group) and create virtual input
+devices (`/dev/uinput`). Note that the `input` group lets any program you run
+read all input devices, keyboards included; that's the same permission
+libinput-gestures and Fusuma need. The program only opens the touchpad and
+`/dev/uinput`, and only runs the actions written in your config.
 
 ## Install
 
@@ -73,7 +111,9 @@ after that, log out and back in.
 
 ## Configure
 
-Edit `~/.config/five-finger-gestures.conf`. Changes apply on the next
+Edit `~/.config/five-finger-gestures.conf` (with a system-wide install that
+only has `/etc/five-finger-gestures.conf`, copy that to `~/.config/` first and
+restart the program). Changes apply on the next
 gesture, no restart needed. Then run `five-finger-gestures --check` to see
 what each gesture does and catch typos.
 
