@@ -1,0 +1,14 @@
+pkgbase = five-finger-gestures
+	pkgdesc = 5-finger touchpad gestures that don't also trigger your desktop's 4-finger gestures
+	pkgver = 1.0.0
+	pkgrel = 1
+	url = https://github.com/aadheel/five-finger-gestures
+	install = five-finger-gestures.install
+	arch = any
+	license = MIT
+	depends = python
+	backup = etc/five-finger-gestures.conf
+	source = five-finger-gestures-1.0.0.tar.gz::https://github.com/aadheel/five-finger-gestures/archive/refs/tags/v1.0.0.tar.gz
+	sha256sums = 65461ee667e45f47a264246bfed738c42f7c1e77d5824a0f8b63c8d0d7d473f1
+
+pkgname = five-finger-gestures

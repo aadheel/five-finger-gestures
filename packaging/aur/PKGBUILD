@@ -10,7 +10,7 @@ depends=('python')
 backup=('etc/five-finger-gestures.conf')
 install=five-finger-gestures.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('65461ee667e45f47a264246bfed738c42f7c1e77d5824a0f8b63c8d0d7d473f1')
 
 package() {
     cd "$pkgname-$pkgver"
